@@ -1,3 +1,4 @@
+#include <Arduino.h>
 #include <lvgl.h>
 #include <Arduino_GFX_Library.h>
 #include "button.hpp"
@@ -5,15 +6,28 @@
 #include "ui.h"
 #include <WiFi.h>
 #include <HTTPClient.h>
-#include <Arduino.h>
-#include "time.h"
-#include <Preferences.h>
-#include "ESPAsyncWebServer.h"
 
-const char* ssid = "SSID";
-const char* password = "PASS";
+#define GFX_BL 38
+#define BUTTON_PIN 3
+#define MOTOR_PIN 7
+#define LED_PIN 4
+#define SCREEN_TIMEOUT 60000
+#define TEMP_FETCH_INTERVAL 5000       // 5 seconds
+#define BOILER_STATUS_FETCH_INTERVAL 2000  // 2 seconds
 
-AsyncWebServer server(80);
+void connectWiFi(void);
+void checkWiFi(void);
+void initScreen(void);
+void my_disp_flush(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *color_p);
+void encoder_read(lv_indev_drv_t *drv, lv_indev_data_t *data);
+void init_lv_group(void);
+void postSetTemp(float temp);
+void fetchCurrentTemp(void);
+void fetchBoilerStatus(void);
+void updateActivityTime(void);
+void checkScreenTimeout(void);
+void setScreenState(bool state);
+void buttonLoop(button_t * btn);
 
 Arduino_DataBus *bus = new Arduino_SWSPI(
   GFX_NOT_DEFINED, /* DC */
@@ -64,15 +78,21 @@ Arduino_RGB_Display *gfx = new Arduino_RGB_Display(
   st7701_type7_init_operations, 
   sizeof(st7701_type7_init_operations)
 );
-#define GFX_BL 38
 
-#define BUTTON_PIN 3
-#define MOTOR_PIN 7
-#define LED_PIN 4
-#define NUM_LEDS 13
+enum WiFiState {
+  WIFI_DISCONNECTED,
+  WIFI_CONNECTING,
+  WIFI_CONNECTED
+};
 
+WiFiState wifiState = WIFI_DISCONNECTED;
+unsigned long lastWiFiAttempt = 0;
+const unsigned long WIFI_RETRY_INTERVAL = 10000; 
 
-//CRGB leds[NUM_LEDS];
+const char* ssid = "CHANGE";
+const char* password = "CHANGE";
+const char* serverIP = "192.168.4.1";
+
 
 static button_t *g_btn;
 static lv_color_t *disp_draw_buf;
@@ -80,37 +100,105 @@ static lv_disp_draw_buf_t draw_buf;
 static lv_disp_drv_t disp_drv;
 static lv_group_t *lv_group;
 
-void my_disp_flush(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *color_p);
-void encoder_read(lv_indev_drv_t *drv, lv_indev_data_t *data);
-void initScreen(void);
-void init_lv_group();
-void handleSetTemp(AsyncWebServerRequest *request);
-void handleTemperature(AsyncWebServerRequest *request);
-void postToSetTemp(const String& value);
-void configureOTA(void);
+// Screen timeout in milliseconds (1 minute)
+unsigned long lastActivityTime = 0;
+bool screenOn = true;
+bool boilerStatus = false;
 
 void setup(void)
 {
   Serial.begin(115200);
-  Serial.println("System start");
-  configureOTA();
-  Serial.println("OTA configured");
-  WiFi.softAP(ssid, password);
-  IPAddress IP = WiFi.softAPIP();
-  Serial.print("AP IP address: ");
-  Serial.println(IP);
-  server.on("/Temp", HTTP_ANY, handleTemperature);
-  server.on("/setTemp", HTTP_ANY, handleSetTemp);
-  server.begin();
-  Serial.println("Server started");
-
+  Serial.println("Starting system");
+  connectWiFi();
   initScreen();
   ui_init();
+
+  // Initial data fetch
+  fetchCurrentTemp();
+  fetchBoilerStatus();
+  
+  // Initialize activity timer
+  updateActivityTime();
 }
 
 void loop(void)
 {
+  static unsigned long lastTempFetchTime = 0, lastBoilerStatusFetchTime = 0;
+  
+  // Handle LVGL tasks
   lv_timer_handler();
+  
+  // Check WiFi connection
+  checkWiFi();
+  
+  // Check for screen timeout
+  checkScreenTimeout();
+  
+  buttonLoop(g_btn);
+  // Periodically fetch temperature
+  unsigned long currentMillis = millis();
+  if (currentMillis - lastTempFetchTime >= TEMP_FETCH_INTERVAL) {
+    lastTempFetchTime = currentMillis;
+    fetchCurrentTemp();
+  }
+  
+  // Periodically fetch boiler status
+  if (currentMillis - lastBoilerStatusFetchTime >= BOILER_STATUS_FETCH_INTERVAL) {
+    lastBoilerStatusFetchTime = currentMillis;
+    fetchBoilerStatus();
+  }
+}
+
+void checkWiFi(void)
+{
+  unsigned long currentMillis = millis();
+  
+  switch (wifiState) {
+    case WIFI_DISCONNECTED:
+      // Try to connect if enough time has passed since last attempt
+      if (currentMillis - lastWiFiAttempt >= WIFI_RETRY_INTERVAL) {
+        connectWiFi();
+      }
+      break;
+      
+    case WIFI_CONNECTING:
+      // Check if connected
+      if (WiFi.status() == WL_CONNECTED) {
+        Serial.println("Connected to WiFi");
+        Serial.print("IP address: ");
+        Serial.println(WiFi.localIP());
+        wifiState = WIFI_CONNECTED;
+      } 
+      // Check for timeout (5 seconds)
+      else if (currentMillis - lastWiFiAttempt >= 5000) {
+        Serial.println("WiFi connection attempt timed out");
+        wifiState = WIFI_DISCONNECTED;
+        WiFi.disconnect();
+      }
+      break;
+      
+    case WIFI_CONNECTED:
+      // Check if we've lost connection
+      if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("WiFi connection lost");
+        wifiState = WIFI_DISCONNECTED;
+        WiFi.disconnect();
+      }
+      break;
+  }
+}
+
+void connectWiFi(void)
+{
+  if (wifiState == WIFI_CONNECTING) {
+    // Already trying to connect
+    return;
+  }
+
+  Serial.println("Starting WiFi connection...");
+  WiFi.begin(ssid, password);
+  wifiState = WIFI_CONNECTING;
+  lastWiFiAttempt = millis();
 }
 
 void initScreen(void)
@@ -185,6 +273,15 @@ void encoder_read(lv_indev_drv_t *drv, lv_indev_data_t *data)
   
   if (count_temp != count_temp_last)
   {
+    // Update activity time when encoder is rotated
+    updateActivityTime();
+    
+    // Turn on screen if it was off
+    if (!screenOn)
+    {
+      setScreenState(true);
+    }
+    
     int16_t dif_temp = count_temp_last - count_temp;
     //Serial.printf( "\nTemp lvgl : %02d\n" , temp_lvgl);
     //Serial.printf("dif temp : %02d. count temp : %02d\n", dif_temp, count_temp);
@@ -203,13 +300,28 @@ void encoder_read(lv_indev_drv_t *drv, lv_indev_data_t *data)
       lv_obj_move_foreground(ui_ArcSetTemp);
     }
     count_temp_last = count_temp;
-    // Enviar nueva temperatura al servidor
-    postToSetTemp(String(temp_lvgl));
+    // Send new temperature to server
+    postSetTemp((float)temp_lvgl);
   }
-  
 }
 
-// starts lvgls group
+// Button callback function
+void buttonLoop(button_t * btn)
+{
+  if(button_wasPressed(btn))
+  {
+    // Update activity time when button is pressed
+    updateActivityTime();
+    
+    // Turn on screen if it was off
+    if (!screenOn)
+    {
+      setScreenState(true);
+    }
+  }
+}
+
+// Starts LVGL group
 void init_lv_group(void)
 {
   lv_group = lv_group_create();
@@ -224,101 +336,166 @@ void init_lv_group(void)
   }
 }
 
-void handleTemperature(AsyncWebServerRequest *request) 
+// Send temperature setting to server
+void postSetTemp(float temp) 
 {
-  // For GET requests (browser access)
-  if (request->method() == HTTP_GET) {
-    int currentTemp = lv_arc_get_value(ui_ArcTemp);
-    
-    // Create a simple HTML page that displays the current temperature
-    String html = "<html><body>";
-    html += "<h1>Current Temperature: " + String(currentTemp) + "</h1>";
-    html += "</body></html>";
-    
-    request->send(200, "text/html", html);
+  if (wifiState != WIFI_CONNECTED)
+  {
+    Serial.println("WiFi not connected. Cannot post temperature.");
+    return;
   }
-  // For POST requests (from clients)
-  else if (request->method() == HTTP_POST) {
-    if (request->hasParam("value", true)) {
-      String tempValue = request->getParam("value", true)->value();
-      Serial.println("Received Temperature: " + tempValue);
-      
-      // Update the temperature display
-      int temp = tempValue.toInt();
-      lv_arc_set_value(ui_ArcTemp, temp);
-      lv_label_set_text_fmt(ui_LabelTemp, "Temp: %02d", temp);
-      
-      // Update display foreground/background based on temps
-      if (lv_arc_get_value(ui_ArcSetTemp) >= lv_arc_get_value(ui_ArcTemp)) {
-        lv_obj_move_foreground(ui_ArcTemp);
-      } else {
-        lv_obj_move_foreground(ui_ArcSetTemp);
-      }
-      
-      request->send(200, "text/plain", "Temperature received");
-    } else {
-      request->send(400, "text/plain", "Bad Request: No temperature value found");
-    }
-  }
-  // For other HTTP methods
-  else {
-    request->send(405, "Method Not Allowed");
-  }
-}
 
-
-void handleSetTemp(AsyncWebServerRequest *request) {
-  // For GET requests (browser access)
-  if (request->method() == HTTP_GET) {
-    int setTemp = lv_arc_get_value(ui_ArcSetTemp);
-    
-    // Create a simple HTML page that displays the current set temperature
-    String html = "<html><body>";
-    html += "<h1>Current Set Temperature: " + String(setTemp) + "</h1>";
-    html += "</body></html>";
-    
-    request->send(200, "text/html", html);
-  }
-  // For POST requests (from encoder updates)
-  else if (request->method() == HTTP_POST) {
-    if (request->hasParam("value", true)) {
-      String tempValue = request->getParam("value", true)->value();
-      Serial.println("Received Set Temperature: " + tempValue);
-      // Process the set temperature here
-      request->send(200, "text/plain", "Set temperature received");
-    } else {
-      request->send(400, "text/plain", "Bad Request: No temperature value found");
-    }
-  }
-  // For other HTTP methods
-  else {
-    request->send(405, "Method Not Allowed");
-  }
-}
-
-void postToSetTemp(const String& value) 
-{
+  WiFiClient client;
   HTTPClient http;
-  http.begin("http://192.168.4.1/setTemp"); // Cambia IP o dominio si es necesario
+  char serverName[50];
+  snprintf(serverName, sizeof(serverName), "http://%s/setTemp", serverIP);
+  http.begin(client, serverName);
   http.addHeader("Content-Type", "application/x-www-form-urlencoded");
 
-  String postData = "value=" + value;
+  String postData = "value=" + String(temp);
   int httpResponseCode = http.POST(postData);
 
-  if (httpResponseCode > 0) {
-    Serial.printf("[POST /setTemp] Código de respuesta: %d\n", httpResponseCode);
-    String response = http.getString();
-    Serial.println("Respuesta: " + response);
-  } else {
-    Serial.printf("[POST /setTemp] Error en la petición: %s\n", http.errorToString(httpResponseCode).c_str());
+  if (httpResponseCode > 0) 
+  {
+    Serial.print("POST response: ");
+    Serial.println(http.getString());
   }
-
+  else
+  {
+    Serial.print("POST error code: ");
+    Serial.println(httpResponseCode);
+  }
+  
   http.end();
 }
 
-void configureOTA(void)
+// Fetch current temperature from server
+void fetchCurrentTemp(void)
 {
-  //Access point and station
-  WiFi.mode(WIFI_AP_STA);
+  static float lastFetchTemp = DEFAULT_TEMP;
+  float temp = lastFetchTemp;
+  if (wifiState  != WIFI_CONNECTED)
+  {
+    Serial.println("WiFi not connected. Cannot fetch temperature.");
+  }
+  else
+  {
+    WiFiClient client;
+    HTTPClient http;
+    char serverName[50];
+    // Add "?plain" to the URL to get plain text response
+    snprintf(serverName, sizeof(serverName), "http://%s/Temp?plain", serverIP);
+    http.begin(client, serverName);
+  
+    int httpResponseCode = http.GET();
+    
+    if (httpResponseCode > 0) 
+    {
+      String response = http.getString();
+      Serial.print("Temperature from server: ");
+      Serial.println(response);
+      
+      // Parse the temperature value
+      temp = response.toFloat();
+      
+    }
+    else
+    {
+      Serial.print("GET temperature error code: ");
+      Serial.println(httpResponseCode);
+    }
+    
+    http.end();
+  }
+  // Update UI with current temperature
+  lv_label_set_text_fmt(ui_LabelTemp, "Temp: %02d", (int)temp);
+  lv_arc_set_value(ui_ArcTemp, (int)temp);
+  
+  // Set shorter arc to the front
+  if (lv_arc_get_value(ui_ArcSetTemp) >= lv_arc_get_value(ui_ArcTemp))
+  {
+    lv_obj_move_foreground(ui_ArcTemp);
+  }
+  else
+  {
+    lv_obj_move_foreground(ui_ArcSetTemp);
+  }
+  lastFetchTemp = temp;
+}
 
+// Fetch boiler status from server
+void fetchBoilerStatus(void)
+{
+  if (wifiState != WIFI_CONNECTED)
+  {
+    Serial.println("WiFi not connected. Cannot fetch boiler status.");
+    return;
+  }
+
+  WiFiClient client;
+  HTTPClient http;
+  char serverName[50];
+  snprintf(serverName, sizeof(serverName), "http://%s/boilerStatus?plain", serverIP);
+  http.begin(client, serverName);
+  
+  int httpResponseCode = http.GET();
+  
+  if (httpResponseCode > 0) 
+  {
+    String response = http.getString();
+    Serial.print("Boiler status from server: ");
+    Serial.println(response);
+    
+    // Parse the boiler status (true/false)
+    response.toLowerCase();
+    bool newBoilerStatus = (response == "true" || response == "1");
+    
+    // Only process changes in status
+    if (boilerStatus != newBoilerStatus)
+    {
+      boilerStatus = newBoilerStatus;
+      
+      // Turn on screen if boiler is active
+      if (boilerStatus && !screenOn)
+      {
+        setScreenState(true);
+        updateActivityTime(); // Reset the screen timeout
+      }
+    }
+  }
+  else
+  {
+    Serial.print("GET boiler status error code: ");
+    Serial.println(httpResponseCode);
+  }
+  
+  http.end();
+}
+
+// Update the last activity timestamp
+void updateActivityTime(void)
+{
+  lastActivityTime = millis();
+}
+
+// Check if screen should time out
+void checkScreenTimeout(void)
+{
+  if (screenOn && !boilerStatus)
+  {
+    // Only check timeout if screen is on and boiler is not active
+    if ((millis() - lastActivityTime) > SCREEN_TIMEOUT)
+    {
+      setScreenState(false);
+    }
+  }
+}
+
+// Control screen power state
+void setScreenState(bool state)
+{
+  screenOn = state;
+  digitalWrite(GFX_BL, state ? HIGH : LOW);
+  Serial.print("Screen turned ");
+  Serial.println(state ? "ON" : "OFF");
 }
